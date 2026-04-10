@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from collections import deque
 from datetime import datetime
@@ -141,14 +142,15 @@ class JeesGateway(BaseGateway):
 
     default_name: str = "JEES"
 
-    default_setting: dict[str, str] = {
+    default_setting: dict[str, str | list[str]] = {  # type: ignore[assignment]
         "用户名": "",
         "密码": "",
         "经纪商代码": "",
         "交易服务器": "",
         "行情服务器": "",
         "产品名称": "",
-        "授权编码": ""
+        "授权编码": "",
+        "柜台环境": ["实盘", "测试"]
     }
 
     exchanges: list[str] = list(EXCHANGE_JEES2VT.values())
@@ -174,6 +176,9 @@ class JeesGateway(BaseGateway):
         appid: str = setting["产品名称"]
         auth_code: str = setting["授权编码"]
 
+        envrionment: str = setting.get("柜台环境", "实盘")
+        production_mode: bool = envrionment == "实盘"
+
         if (
             (not td_address.startswith("tcp://"))
             and (not td_address.startswith("ssl://"))
@@ -181,17 +186,19 @@ class JeesGateway(BaseGateway):
         ):
             td_address = "tcp://" + td_address
 
-        if (
-            (not md_address.startswith("tcp://"))
-            and (not md_address.startswith("ssl://"))
-            and (not md_address.startswith("socks"))
-        ):
-            md_address = "tcp://" + md_address
+        md_addresses: list[str] = [
+            addr if (
+                addr.startswith("tcp://")
+                or addr.startswith("ssl://")
+                or addr.startswith("socks")
+            ) else f"tcp://{addr}"
+            for addr in expand_domain_template(md_address)
+        ]
 
         self._set_limit_retry(not self._load_limit_prices())
 
         self.td_api.connect(td_address, userid, password, brokerid, auth_code, appid)
-        self.md_api.connect(md_address, userid, password, brokerid)
+        self.md_api.connect(md_addresses, userid, password, brokerid, production_mode)
 
         self.init_query()
 
@@ -228,8 +235,9 @@ class JeesGateway(BaseGateway):
         """输出错误信息日志"""
         error_id: int = error["ErrorID"]
         error_msg: str = error["ErrorMsg"]
-        msg = f"{msg}，代码：{error_id}，信息：{error_msg}"
-        self.write_log(msg)
+
+        log_msg: str = f"{msg}，代码：{error_id}，信息：{error_msg}"
+        self.write_log(log_msg)
 
     def process_timer_event(self, event: Event) -> None:
         """定时事件处理"""
@@ -682,7 +690,7 @@ class JeesTdApi(TdApi):
                 position.yd_volume = data["Position"] - data["TodayPosition"]
 
             # 获取合约的乘数信息
-            size: int = contract.size
+            size: float = contract.size
 
             # 计算之前已有仓位的持仓总成本
             cost: float = position.price * position.volume * size
@@ -1075,3 +1083,25 @@ def adjust_price(price: float) -> float:
     if price == MAX_FLOAT:
         price = 0
     return price
+
+
+def expand_domain_template(address: str) -> list[str]:
+    """将域名模板扩展为实际地址列表"""
+    match = re.search(r"{([0-9,/]+)}", address)
+    if match:
+        ranges_str: str = match.group(1)
+        numbers: set[int] = set()
+
+        for part in ranges_str.split(","):
+            if "/" in part:
+                start, end = map(int, part.split("/"))
+                numbers.update(range(start, end + 1))
+            else:
+                numbers.add(int(part))
+
+        return [address.replace(match.group(0), str(i)) for i in sorted(numbers)]
+
+    if "," in address:
+        return [addr.strip() for addr in address.split(",") if addr.strip()]
+
+    return [address]
