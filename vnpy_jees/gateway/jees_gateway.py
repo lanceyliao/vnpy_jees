@@ -1,7 +1,10 @@
+import json
 import sys
+from collections import deque
 from datetime import datetime
 from time import sleep
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 from vnpy.event import EventEngine, Event
 from vnpy.trader.constant import (
@@ -62,6 +65,7 @@ from ..api import (
 )
 
 from vnpy_ctp.api import MdApi
+
 # 委托状态映射
 STATUS_JEES2VT: dict[str, Status] = {
     THOST_FTDC_OST_NoTradeQueueing: Status.NOTTRADED,
@@ -157,6 +161,8 @@ class JeesGateway(BaseGateway):
         self.md_api: CtpMdApi = CtpMdApi(self)
 
         self.count: int = 0
+        self._limit_price_cache: dict[str, dict[str, float]] = {}
+        self._limit_retry_registered: bool = False
 
     def connect(self, setting: dict) -> None:
         """连接交易接口"""
@@ -182,6 +188,8 @@ class JeesGateway(BaseGateway):
         ):
             md_address = "tcp://" + md_address
 
+        self._set_limit_retry(not self._load_limit_prices())
+
         self.td_api.connect(td_address, userid, password, brokerid, auth_code, appid)
         self.md_api.connect(md_address, userid, password, brokerid)
 
@@ -190,6 +198,10 @@ class JeesGateway(BaseGateway):
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
         self.md_api.subscribe(req)
+
+    def unsubscribe(self, req: SubscribeRequest) -> None:
+        """退订行情"""
+        self.md_api.unsubscribe(req)
 
     def send_order(self, req: OrderRequest) -> str:
         """委托下单"""
@@ -221,6 +233,8 @@ class JeesGateway(BaseGateway):
 
     def process_timer_event(self, event: Event) -> None:
         """定时事件处理"""
+        self.md_api.flush_subscribe_queue()
+
         self.count += 1
         if self.count < 2:
             return
@@ -238,6 +252,69 @@ class JeesGateway(BaseGateway):
         self.query_functions: list = [self.query_account, self.query_position]
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
 
+    def on_contract(self, contract: ContractData) -> None:
+        """合约信息推送"""
+        self._apply_limit_prices(contract)
+        super().on_contract(contract)
+
+    def _apply_limit_prices(self, contract: ContractData) -> None:
+        """把缓存中的涨跌停价写回合约对象"""
+        if contract.extra is None:
+            contract.extra = {}
+        contract.extra.update(self._limit_price_cache.get(contract.vt_symbol, {}))
+
+    def _backfill_published_contracts(self) -> None:
+        """通过on_contract重发已发布合约"""
+        for contract in list(symbol_contract_map.values()):
+            self.on_contract(contract)
+
+    def _set_limit_retry(self, active: bool) -> None:
+        """切换涨跌停HTTP重试定时器"""
+        if active == self._limit_retry_registered:
+            return
+
+        if active:
+            self.event_engine.register(EVENT_TIMER, self._on_limit_retry_timer)
+            self.write_log("涨跌停价首次加载失败，已注册EVENT_TIMER定时重试")
+        else:
+            self.event_engine.unregister(EVENT_TIMER, self._on_limit_retry_timer)
+
+        self._limit_retry_registered = active
+
+    def _on_limit_retry_timer(self, event: Event) -> None:
+        """EVENT_TIMER回调：定时重试HTTP加载涨跌停"""
+        if self._load_limit_prices():
+            self._backfill_published_contracts()
+            self._set_limit_retry(False)
+            self.write_log("涨跌停价定时重试成功，已通过on_contract重发已发布合约并注销EVENT_TIMER重试")
+
+    def _load_limit_prices(self) -> bool:
+        """通过HTTP加载涨跌停缓存"""
+        request: Request = Request("http://dict.openctp.cn/prices?types=futures")
+
+        try:
+            with urlopen(request, timeout=5) as response:
+                encoding: str = response.headers.get_content_charset() or "utf-8"
+                payload = json.loads(response.read().decode(encoding, errors="replace"))
+
+            data: list | None = payload.get("data") if isinstance(payload, dict) else None
+            if payload.get("rsp_code") not in (None, 0, "0", 200, "200") or not isinstance(data, list):
+                return False
+
+            cache: dict[str, dict[str, float]] = {}
+            for item in data:
+                cache[f"{item['InstrumentID']}.{item['ExchangeID']}"] = {
+                    "limit_up": item["UpperLimitPrice"],
+                    "limit_down": item["LowerLimitPrice"],
+                }
+
+            self._limit_price_cache = cache
+            self.write_log(f"涨跌停价加载成功，缓存键数量：{len(cache)}")
+            return True
+        except Exception:
+            self.write_log("涨跌停价加载失败")
+            return False
+
 
 class CtpMdApi(MdApi):
 
@@ -252,7 +329,8 @@ class CtpMdApi(MdApi):
 
         self.connect_status: bool = False
         self.login_status: bool = False
-        self.subscribed: set = set()
+        self.subscribed: set[str] = set()
+        self.subscribe_queue: deque[tuple[str, bool]] = deque()
 
         self.userid: str = ""
         self.password: str = ""
@@ -277,7 +355,7 @@ class CtpMdApi(MdApi):
             self.gateway.write_log("行情服务器登录成功")
 
             for symbol in self.subscribed:
-                self.subscribeMarketData(symbol)
+                self.subscribe_queue.append((symbol, True))
         else:
             self.gateway.write_error("行情服务器登录失败", error)
 
@@ -374,6 +452,8 @@ class CtpMdApi(MdApi):
             self.init()
 
             self.connect_status = True
+        elif not self.login_status:
+            self.login()
 
     def login(self) -> None:
         """用户登录"""
@@ -388,9 +468,42 @@ class CtpMdApi(MdApi):
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
-        if self.login_status:
-            self.subscribeMarketData(req.symbol)
-        self.subscribed.add(req.symbol)
+        symbol: str = req.symbol
+        self.subscribed.add(symbol)
+        self.subscribe_queue.append((symbol, True))
+
+    def unsubscribe(self, req: SubscribeRequest) -> None:
+        """退订行情"""
+        symbol: str = req.symbol
+        self.subscribed.discard(symbol)
+        self.subscribe_queue.append((symbol, False))
+
+    def flush_subscribe_queue(self) -> None:
+        """定时批量发送订阅/退订请求"""
+        if not self.login_status:
+            return
+
+        latest_actions: dict[str, bool] = {}
+
+        while self.subscribe_queue:
+            symbol, subscribe = self.subscribe_queue.popleft()
+            latest_actions[symbol] = subscribe
+
+        if not latest_actions:
+            return
+
+        subscribe_symbols: list[str] = [
+            symbol for symbol, subscribe in latest_actions.items() if subscribe
+        ]
+        unsubscribe_symbols: list[str] = [
+            symbol for symbol, subscribe in latest_actions.items() if not subscribe
+        ]
+
+        if subscribe_symbols:
+            self.subscribeMarketData(subscribe_symbols)
+
+        if unsubscribe_symbols:
+            self.unSubscribeMarketData(unsubscribe_symbols)
 
     def close(self) -> None:
         """关闭连接"""
@@ -704,9 +817,8 @@ class JeesTdApi(TdApi):
                 contract.option_listed = datetime.strptime(data["OpenDate"], "%Y%m%d")
                 contract.option_expiry = datetime.strptime(data["ExpireDate"], "%Y%m%d")
 
-            self.gateway.on_contract(contract)
-
             symbol_contract_map[contract.symbol] = contract
+            self.gateway.on_contract(contract)
 
         if last:
             self.contract_inited = True
