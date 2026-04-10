@@ -942,8 +942,11 @@ class JeesTdApi(TdApi):
 
         if not self.connect_status:
             path: Path = get_folder_path(self.gateway_name.lower())
-            self.createFtdcTraderApi((str(path) + "\\Td").encode("GBK"))
-
+            td_path: Path = path / "Td"
+            td_path.mkdir(parents=True, exist_ok=True)
+            (td_path / "Jees_Log").mkdir(parents=True, exist_ok=True)
+            self.createFtdcTraderApi(str(td_path).encode("GBK"))
+ 
             self.subscribePrivateTopic(0)
             self.subscribePublicTopic(0)
 
