@@ -339,6 +339,7 @@ class CtpMdApi(MdApi):
         self.login_status: bool = False
         self.subscribed: set[str] = set()
         self.subscribe_queue: deque[tuple[str, bool]] = deque()
+        self.symbol_exchange_map: dict[str, Exchange] = {}
 
         self.userid: str = ""
         self.password: str = ""
@@ -386,25 +387,34 @@ class CtpMdApi(MdApi):
 
         # 过滤还没有收到合约数据前的行情推送
         symbol: str = data["InstrumentID"]
-        contract: ContractData = symbol_contract_map.get(symbol, None)
-        if not contract:
+        contract: ContractData | None = symbol_contract_map.get(symbol, None)
+
+        exchange: Exchange | None = None
+        name: str = symbol
+        if contract:
+            exchange = contract.exchange
+            name = contract.name
+        else:
+            exchange = self.symbol_exchange_map.get(symbol, None)
+
+        if not exchange:
             return
 
         # 对大商所的交易日字段取本地日期
-        if not data["ActionDay"] or contract.exchange == Exchange.DCE:
+        if not data["ActionDay"] or exchange == Exchange.DCE:
             date_str: str = self.current_date
         else:
             date_str = data["ActionDay"]
 
-        timestamp: str = f"{date_str} {data['UpdateTime']}.{int(data['UpdateMillisec']/100)}"
+        timestamp: str = f"{date_str} {data['UpdateTime']}.{data['UpdateMillisec']}"
         dt: datetime = datetime.strptime(timestamp, "%Y%m%d %H:%M:%S.%f")
         dt = dt.replace(tzinfo=CHINA_TZ)
 
         tick: TickData = TickData(
             symbol=symbol,
-            exchange=contract.exchange,
+            exchange=exchange,
             datetime=dt,
-            name=contract.name,
+            name=name,
             volume=data["Volume"],
             turnover=data["Turnover"],
             open_interest=data["OpenInterest"],
@@ -445,7 +455,14 @@ class CtpMdApi(MdApi):
 
         self.gateway.on_tick(tick)
 
-    def connect(self, address: str, userid: str, password: str, brokerid: str) -> None:
+    def connect(
+        self,
+        addresses: list[str],
+        userid: str,
+        password: str,
+        brokerid: str,
+        production_mode: bool
+    ) -> None:
         """连接服务器"""
         self.userid = userid
         self.password = password
@@ -454,14 +471,13 @@ class CtpMdApi(MdApi):
         # 禁止重复发起连接，会导致异常崩溃
         if not self.connect_status:
             path: Path = get_folder_path(self.gateway_name.lower())
-            self.createFtdcMdApi((str(path) + "\\Md").encode("GBK"))
+            self.createFtdcMdApi((str(path) + "\\Md").encode("GBK"), production_mode)
 
-            self.registerFront(address)
+            for address in addresses:
+                self.registerFront(address)
             self.init()
 
             self.connect_status = True
-        elif not self.login_status:
-            self.login()
 
     def login(self) -> None:
         """用户登录"""
@@ -477,6 +493,7 @@ class CtpMdApi(MdApi):
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
         symbol: str = req.symbol
+        self.symbol_exchange_map[symbol] = req.exchange
         self.subscribed.add(symbol)
         self.subscribe_queue.append((symbol, True))
 
