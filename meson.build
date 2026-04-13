@@ -31,26 +31,58 @@ message('构建目标系统: ' + host_machine.system())
 # 初始化变量
 thosttraderapi_lib = []
 extra_cpp_args = []
+extra_link_args = []
 
 # 设置Windows特定编译选项
-# Windows编译器设置
-add_project_arguments('/MT', language : 'cpp')
+if host_machine.system() == 'windows'
+  # Windows编译器设置
+  add_project_arguments('/MT', language : 'cpp')
+  
+  # 设置库目录
+  lib_dir = meson.current_source_dir() / 'vnpy_jees/api/libs'
+  api_dir = meson.current_source_dir() / 'vnpy_jees/api'
+  
+  # 设置include目录
+  include_dirs = include_directories(
+    'vnpy_jees/api/include',
+    'vnpy_jees/api/vnjees',
+    pybind11_include_dir,
+  )
+  
+  # 定义CTP库
+  thosttraderapi_lib = cpp.find_library('thosttraderapi_se', 
+                                       dirs: [lib_dir, api_dir],
+                                       required: true)
 
-# 设置库目录
-lib_dir = meson.current_source_dir() / 'vnpy_jees/api/libs'
-api_dir = meson.current_source_dir() / 'vnpy_jees/api'
-
-# 设置include目录
-include_dirs = include_directories(
-  'vnpy_jees/api/include',
-  'vnpy_jees/api/vnjees',
-  pybind11_include_dir,
-)
-
-# 定义CTP库
-thosttraderapi_lib = cpp.find_library('thosttraderapi_se', 
-                                     dirs: [lib_dir, api_dir],
-                                     required: true)
+# 设置Linux特定编译选项
+else  # Linux
+  # Linux编译器设置
+  extra_cpp_args = [
+    '-std=c++17',
+    '-O3',
+    '-Wno-delete-incomplete',
+    '-Wno-sign-compare',
+  ]
+  
+  extra_link_args = [
+    '-lstdc++',
+  ]
+  
+  # 设置库目录
+  lib_dir = meson.current_source_dir() / 'vnpy_jees/api'
+  
+  # 设置include目录
+  include_dirs = include_directories(
+    'vnpy_jees/api/include',
+    'vnpy_jees/api/vnjees',
+    pybind11_include_dir,
+  )
+  
+  # 定义CTP库
+  thosttraderapi_lib = cpp.find_library('thosttraderapi_se', 
+                                       dirs: [lib_dir],
+                                       required: true)
+endif
 
 # 创建TD模块扩展
 td_module = py.extension_module(
@@ -59,7 +91,13 @@ td_module = py.extension_module(
   include_directories: include_dirs,
   dependencies: [py_dep, thosttraderapi_lib],
   cpp_args: extra_cpp_args,
+  link_args: extra_link_args + (host_machine.system() == 'linux' ? [
+    '-L' + lib_dir,
+    '-lthosttraderapi_se',
+    '-Wl,-rpath,$ORIGIN'
+  ] : []),
   install: true,
+  install_rpath: host_machine.system() == 'linux' ? '$ORIGIN' : '',
   subdir: 'vnpy_jees/api'
 )
 
@@ -81,11 +119,22 @@ foreach file : python_files
 endforeach
 
 # 安装API动态库文件
-api_libs = [
-  'vnpy_jees/api/thosttraderapi_se.dll',
-]
-
-install_data(
-  api_libs,
-  install_dir: py.get_install_dir() / 'vnpy_jees/api'
-)
+if host_machine.system() == 'windows'
+  api_libs = [
+    'vnpy_jees/api/thosttraderapi_se.dll',
+  ]
+  
+  install_data(
+    api_libs,
+    install_dir: py.get_install_dir() / 'vnpy_jees/api'
+  )
+else  # Linux
+  api_libs = [
+    'vnpy_jees/api/thosttraderapi_se.so',
+  ]
+  
+  install_data(
+    api_libs,
+    install_dir: py.get_install_dir() / 'vnpy_jees/api'
+  )
+endif
