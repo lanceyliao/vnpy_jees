@@ -130,7 +130,7 @@ if host_machine.system() == 'windows'
   )
 else  # Linux
   api_libs = [
-    'vnpy_jees/api/thosttraderapi_se.so',
+    'vnpy_jees/api/libthosttraderapi_se.so',
   ]
   
   install_data(
