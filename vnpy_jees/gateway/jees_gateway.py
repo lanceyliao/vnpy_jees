@@ -240,6 +240,16 @@ class JeesGateway(BaseGateway):
         self.count: int = 0
         self._limit_price_cache: dict[str, dict[str, float]] = {}
         self._limit_retry_registered: bool = False
+        self.orders: dict[str, OrderData] = {}
+
+    def on_order(self, order: OrderData) -> None:
+        """缓存最新订单并推送"""
+        self.orders[order.orderid] = order
+        super().on_order(order)
+
+    def get_order(self, orderid: str) -> OrderData | None:
+        """获取缓存的订单"""
+        return self.orders.get(orderid, None)
 
     def connect(self, setting: dict) -> None:
         """连接交易接口"""
@@ -1022,8 +1032,26 @@ class JeesTdApi(TdApi):
             datetime=dt,
             gateway_name=self.gateway_name
         )
-        self.gateway.on_order(order)
 
+        last_order: OrderData | None = self.gateway.get_order(orderid)
+        if not last_order:
+            self.gateway.on_order(order)
+            self.sysid_orderid_map[data["OrderSysID"]] = orderid
+            return
+
+        if not last_order.is_active():
+            self.gateway.write_log(
+                f"忽略订单回报，订单号：{order.orderid}，状态：{order.status}，"
+                f"已成交：{order.traded}，剩余：{order.volume - order.traded}"
+            )
+            return
+
+        traded_change: float = order.traded - last_order.traded
+        status_change: bool = order.status != last_order.status
+        if traded_change < 0 or (traded_change == 0 and not status_change):
+            return
+
+        self.gateway.on_order(order)
         self.sysid_orderid_map[data["OrderSysID"]] = orderid
 
     def onRtnTrade(self, data: dict) -> None:
