@@ -261,10 +261,6 @@ class JeesGateway(BaseGateway):
         self.orders[order.orderid] = order
         super().on_order(order)
 
-    def get_order(self, orderid: str) -> OrderData | None:
-        """获取缓存的订单"""
-        return self.orders.get(orderid, None)
-
     def connect(self, setting: dict) -> None:
         """连接交易接口"""
         userid: str = setting["用户名"]
@@ -1046,7 +1042,9 @@ class JeesTdApi(TdApi):
             datetime=dt,
             gateway_name=self.gateway_name
         )
+        
         self.gateway.on_order(order)
+        
         self.sysid_orderid_map[data["OrderSysID"]] = orderid
 
     def onRtnTrade(self, data: dict) -> None:
