@@ -243,7 +243,21 @@ class JeesGateway(BaseGateway):
         self.orders: dict[str, OrderData] = {}
 
     def on_order(self, order: OrderData) -> None:
-        """缓存最新订单并推送"""
+        """仅推送有效增量：成交量上涨，或成交量不变但状态变化"""
+        last_order: OrderData | None = self.orders.get(order.orderid)
+        if last_order:
+            if not last_order.is_active():
+                self.write_log(
+                    f"忽略订单回报，订单号：{order.orderid}，状态：{order.status}，"
+                    f"已成交：{order.traded}，剩余：{order.volume - order.traded}"
+                )
+                return
+
+            traded_change: float = order.traded - last_order.traded
+            status_change: bool = order.status != last_order.status
+            if traded_change < 0 or (traded_change == 0 and not status_change):
+                return
+
         self.orders[order.orderid] = order
         super().on_order(order)
 
@@ -1032,25 +1046,6 @@ class JeesTdApi(TdApi):
             datetime=dt,
             gateway_name=self.gateway_name
         )
-
-        last_order: OrderData | None = self.gateway.get_order(orderid)
-        if not last_order:
-            self.gateway.on_order(order)
-            self.sysid_orderid_map[data["OrderSysID"]] = orderid
-            return
-
-        if not last_order.is_active():
-            self.gateway.write_log(
-                f"忽略订单回报，订单号：{order.orderid}，状态：{order.status}，"
-                f"已成交：{order.traded}，剩余：{order.volume - order.traded}"
-            )
-            return
-
-        traded_change: float = order.traded - last_order.traded
-        status_change: bool = order.status != last_order.status
-        if traded_change < 0 or (traded_change == 0 and not status_change):
-            return
-
         self.gateway.on_order(order)
         self.sysid_orderid_map[data["OrderSysID"]] = orderid
 
