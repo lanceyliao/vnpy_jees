@@ -1042,9 +1042,8 @@ class JeesTdApi(TdApi):
             datetime=dt,
             gateway_name=self.gateway_name
         )
-        
         self.gateway.on_order(order)
-        
+
         self.sysid_orderid_map[data["OrderSysID"]] = orderid
 
     def onRtnTrade(self, data: dict) -> None:
