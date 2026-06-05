@@ -815,7 +815,6 @@ class JeesTdApi(TdApi):
                 sleep(1)
 
         while True:
-            self.reqid += 1
             n = self.query_order()
 
             if not n:
@@ -824,7 +823,6 @@ class JeesTdApi(TdApi):
                 sleep(1)
 
         while True:
-            self.reqid += 1
             n = self.query_trade()
 
             if not n:
@@ -909,37 +907,7 @@ class JeesTdApi(TdApi):
         if not data:
             return
 
-        symbol: str = data["InstrumentID"]
-        contract: ContractData = symbol_contract_map[symbol]
-
-        frontid: int = data["FrontID"]
-        sessionid: int = data["SessionID"]
-        order_ref: str = data["OrderRef"]
-        orderid: str = f"{frontid}_{sessionid}_{order_ref}"
-
-        timestamp: str = f"{data['InsertDate']} {data['InsertTime']}"
-        dt: datetime = datetime.strptime(timestamp, "%Y%m%d %H:%M:%S")
-        dt = dt.replace(tzinfo=CHINA_TZ)
-
-        tp: tuple = (data["OrderPriceType"], data["TimeCondition"], data["VolumeCondition"])
-
-        order: OrderData = OrderData(
-            symbol=symbol,
-            exchange=contract.exchange,
-            orderid=orderid,
-            type=ORDERTYPE_JEES2VT[tp],
-            direction=DIRECTION_JEES2VT[data["Direction"]],
-            offset=OFFSET_JEES2VT[data["CombOffsetFlag"]],
-            price=data["LimitPrice"],
-            volume=data["VolumeTotalOriginal"],
-            traded=data["VolumeTraded"],
-            status=STATUS_JEES2VT[data["OrderStatus"]],
-            datetime=dt,
-            gateway_name=self.gateway_name
-        )
-        self.gateway.on_order(order)
-
-        self.sysid_orderid_map[data["OrderSysID"]] = orderid
+        self._process_order_update(data)
 
     def onRspQryTrade(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         """成交查询回报"""
@@ -1019,6 +987,10 @@ class JeesTdApi(TdApi):
             self.order_data.append(data)
             return
 
+        self._process_order_update(data)
+
+    def _process_order_update(self, data: dict) -> None:
+        """解析委托回报并推送（onRtnOrder / onRspQryOrder 共用）"""
         symbol: str = data["InstrumentID"]
         contract: ContractData = symbol_contract_map[symbol]
 
@@ -1244,6 +1216,7 @@ class JeesTdApi(TdApi):
                 # 如果找不到 OrderSysID，则查询全部订单
                 pass
 
+        self.reqid += 1
         n: int = self.reqQryOrder(jees_req, self.reqid)
         return n
 
@@ -1254,6 +1227,7 @@ class JeesTdApi(TdApi):
             "InvestorID": self.userid
         }
 
+        self.reqid += 1
         n: int = self.reqQryTrade(jees_req, self.reqid)
         return n
 
