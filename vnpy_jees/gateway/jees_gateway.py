@@ -330,6 +330,10 @@ class JeesGateway(BaseGateway):
         st: Settlement | None = self.td_api.settlements.get(trading_day)
         return st.text if st else None
 
+    def query_order(self, orderid: str = "") -> None:
+        """查询委托；可传入 orderid 查询特定订单，不传则查询全部"""
+        self.td_api.query_order(orderid)
+
     def close(self) -> None:
         """关闭接口"""
         self.td_api.close()
@@ -676,6 +680,7 @@ class JeesTdApi(TdApi):
         self.trade_data: list[dict] = []
         self.positions: dict[str, PositionData] = {}
         self.sysid_orderid_map: dict[str, str] = {}
+        self.orderid_sysid_map: dict[str, str] = {}
 
         self.settlements: dict[str, Settlement] = {}
         self.settlement_cap: Settlement = Settlement()
@@ -1045,6 +1050,7 @@ class JeesTdApi(TdApi):
         self.gateway.on_order(order)
 
         self.sysid_orderid_map[data["OrderSysID"]] = orderid
+        self.orderid_sysid_map[orderid] = data["OrderSysID"]
 
     def onRtnTrade(self, data: dict) -> None:
         """成交数据推送"""
@@ -1223,12 +1229,20 @@ class JeesTdApi(TdApi):
         self.reqid += 1
         self.reqQryInvestorPosition(jees_req, self.reqid)
 
-    def query_order(self) -> int:
-        """查询委托"""
+    def query_order(self, orderid: str = "") -> int:
+        """查询委托；可传入 orderid 查询特定订单，不传则查询全部"""
         jees_req: dict = {
             "BrokerID": self.brokerid,
             "InvestorID": self.userid
         }
+        if orderid:
+            # 通过 orderid_sysid_map 反向查找 OrderSysID
+            order_sysid = self.orderid_sysid_map.get(orderid)
+            if order_sysid:
+                jees_req["OrderSysID"] = order_sysid
+            else:
+                # 如果找不到 OrderSysID，则查询全部订单
+                pass
 
         n: int = self.reqQryOrder(jees_req, self.reqid)
         return n
