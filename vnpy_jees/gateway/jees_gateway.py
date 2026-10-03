@@ -1,3 +1,5 @@
+"""实现杰宜斯交易接口。"""
+
 import json
 import re
 import sys
@@ -438,6 +440,7 @@ class JeesGateway(BaseGateway):
 
 
 class CtpMdApi(MdApi):
+    """杰宜斯柜台使用的 CTP 行情接口。"""
 
     def __init__(self, gateway: JeesGateway) -> None:
         """构造函数"""
@@ -654,7 +657,7 @@ class CtpMdApi(MdApi):
 
 
 class JeesTdApi(TdApi):
-    """"""
+    """对接杰宜斯柜台的交易接口。"""
 
     def __init__(self, gateway: JeesGateway) -> None:
         """构造函数"""
@@ -1080,7 +1083,7 @@ class JeesTdApi(TdApi):
             td_path.mkdir(parents=True, exist_ok=True)
             (td_path / "Jees_Log").mkdir(parents=True, exist_ok=True)
             self.createFtdcTraderApi(str(td_path).encode("GBK"))
- 
+
             self.subscribePrivateTopic(0)
             self.subscribePublicTopic(0)
 
