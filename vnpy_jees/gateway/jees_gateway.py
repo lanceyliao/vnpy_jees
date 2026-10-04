@@ -8,6 +8,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from time import sleep
 from pathlib import Path
+from typing import TYPE_CHECKING
 from threading import Lock
 from urllib.request import Request, urlopen
 
@@ -70,6 +71,16 @@ from ..api import (
 )
 
 from vnpy_ctp.api import MdApi
+
+if TYPE_CHECKING:
+    from vnpy_ctp.api import MdApi
+else:
+    # 行情使用 CTP 的 MdApi。本扩展与 vnpy_ctp 都会加载 thosttraderapi_se.dll，
+    # 缺少 vnpy_ctp 时仍允许导入交易接口，避免交易回调在导入阶段失败。
+    try:
+        from vnpy_ctp.api import MdApi
+    except ImportError:
+        MdApi = None
 
 # 委托状态映射
 STATUS_JEES2VT: dict[str, Status] = {
@@ -238,7 +249,8 @@ class JeesGateway(BaseGateway):
         super().__init__(event_engine, gateway_name)
 
         self.td_api: JeesTdApi = JeesTdApi(self)
-        self.md_api: CtpMdApi = CtpMdApi(self)
+        if MdApi is not None:
+            self.md_api: CtpMdApi = CtpMdApi(self)
         self.settlements: dict[str, Settlement] = self.td_api.settlements
 
         self.count: int = 0
@@ -301,13 +313,15 @@ class JeesGateway(BaseGateway):
         self._set_limit_retry(not self._load_limit_prices())
 
         self.td_api.connect(td_address, userid, password, brokerid, auth_code, appid)
-        self.md_api.connect(md_addresses, userid, password, brokerid, production_mode)
+        if MdApi is not None:
+            self.md_api.connect(md_addresses, userid, password, brokerid, production_mode)
 
         self.init_query()
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
-        self.md_api.subscribe(req)
+        if MdApi is not None:
+            self.md_api.subscribe(req)
 
     def unsubscribe(self, req: SubscribeRequest) -> None:
         """退订行情"""
@@ -345,7 +359,8 @@ class JeesGateway(BaseGateway):
     def close(self) -> None:
         """关闭接口"""
         self.td_api.close()
-        self.md_api.close()
+        if MdApi is not None:
+            self.md_api.close()
 
     def write_error(self, msg: str, error: dict) -> None:
         """输出错误信息日志"""
@@ -368,7 +383,8 @@ class JeesGateway(BaseGateway):
         func()
         self.query_functions.append(func)
 
-        self.md_api.update_date()
+        if MdApi is not None:
+            self.md_api.update_date()
 
     def init_query(self) -> None:
         """初始化查询任务"""
@@ -440,222 +456,223 @@ class JeesGateway(BaseGateway):
             return False
 
 
-class CtpMdApi(MdApi):
-    """杰宜斯柜台使用的 CTP 行情接口。"""
+if TYPE_CHECKING or MdApi is not None:
+    class CtpMdApi(MdApi):
+        """杰宜斯柜台使用的 CTP 行情接口。"""
 
-    def __init__(self, gateway: JeesGateway) -> None:
-        """构造函数"""
-        super().__init__()
+        def __init__(self, gateway: JeesGateway) -> None:
+            """构造函数"""
+            super().__init__()
 
-        self.gateway: JeesGateway = gateway
-        self.gateway_name: str = gateway.gateway_name
+            self.gateway: JeesGateway = gateway
+            self.gateway_name: str = gateway.gateway_name
 
-        self.reqid: int = 0
+            self.reqid: int = 0
 
-        self.connect_status: bool = False
-        self.login_status: bool = False
-        self.subscribed: set[str] = set()
-        self.subscribe_queue: deque[tuple[str, bool]] = deque()
-        self.symbol_exchange_map: dict[str, Exchange] = {}
+            self.connect_status: bool = False
+            self.login_status: bool = False
+            self.subscribed: set[str] = set()
+            self.subscribe_queue: deque[tuple[str, bool]] = deque()
+            self.symbol_exchange_map: dict[str, Exchange] = {}
 
-        self.userid: str = ""
-        self.password: str = ""
-        self.brokerid: str = ""
+            self.userid: str = ""
+            self.password: str = ""
+            self.brokerid: str = ""
 
-        self.current_date: str = datetime.now().strftime("%Y%m%d")
+            self.current_date: str = datetime.now().strftime("%Y%m%d")
 
-    def onFrontConnected(self) -> None:
-        """服务器连接成功回报"""
-        self.gateway.write_log("行情服务器连接成功")
-        self.login()
+        def onFrontConnected(self) -> None:
+            """服务器连接成功回报"""
+            self.gateway.write_log("行情服务器连接成功")
+            self.login()
 
-    def onFrontDisconnected(self, reason: int) -> None:
-        """服务器连接断开回报"""
-        self.login_status = False
-        self.gateway.write_log(f"行情服务器连接断开，原因{reason}")
+        def onFrontDisconnected(self, reason: int) -> None:
+            """服务器连接断开回报"""
+            self.login_status = False
+            self.gateway.write_log(f"行情服务器连接断开，原因{reason}")
 
-    def onRspUserLogin(self, data: dict, error: dict, reqid: int, last: bool) -> None:
-        """用户登录请求回报"""
-        if not error["ErrorID"]:
-            self.login_status = True
-            self.gateway.write_log("行情服务器登录成功")
+        def onRspUserLogin(self, data: dict, error: dict, reqid: int, last: bool) -> None:
+            """用户登录请求回报"""
+            if not error["ErrorID"]:
+                self.login_status = True
+                self.gateway.write_log("行情服务器登录成功")
 
-            symbol: str
-            for symbol in self.subscribed:
-                self.subscribe_queue.append((symbol, True))
-        else:
-            self.gateway.write_error("行情服务器登录失败", error)
+                symbol: str
+                for symbol in self.subscribed:
+                    self.subscribe_queue.append((symbol, True))
+            else:
+                self.gateway.write_error("行情服务器登录失败", error)
 
-    def onRspError(self, error: dict, reqid: int, last: bool) -> None:
-        """请求报错回报"""
-        self.gateway.write_error("行情接口报错", error)
+        def onRspError(self, error: dict, reqid: int, last: bool) -> None:
+            """请求报错回报"""
+            self.gateway.write_error("行情接口报错", error)
 
-    def onRspSubMarketData(self, data: dict, error: dict, reqid: int, last: bool) -> None:
-        """订阅行情回报"""
-        if not error or not error["ErrorID"]:
-            return
+        def onRspSubMarketData(self, data: dict, error: dict, reqid: int, last: bool) -> None:
+            """订阅行情回报"""
+            if not error or not error["ErrorID"]:
+                return
 
-        self.gateway.write_error("行情订阅失败", error)
+            self.gateway.write_error("行情订阅失败", error)
 
-    def onRtnDepthMarketData(self, data: dict) -> None:
-        """行情数据推送"""
-        # 过滤没有时间戳的异常行情数据
-        if not data["UpdateTime"]:
-            return
+        def onRtnDepthMarketData(self, data: dict) -> None:
+            """行情数据推送"""
+            # 过滤没有时间戳的异常行情数据
+            if not data["UpdateTime"]:
+                return
 
-        # 过滤还没有收到合约数据前的行情推送
-        symbol: str = data["InstrumentID"]
-        contract: ContractData | None = symbol_contract_map.get(symbol, None)
+            # 过滤还没有收到合约数据前的行情推送
+            symbol: str = data["InstrumentID"]
+            contract: ContractData | None = symbol_contract_map.get(symbol, None)
 
-        exchange: Exchange | None = None
-        name: str = symbol
-        if contract:
-            exchange = contract.exchange
-            name = contract.name
-        else:
-            exchange = self.symbol_exchange_map.get(symbol, None)
+            exchange: Exchange | None = None
+            name: str = symbol
+            if contract:
+                exchange = contract.exchange
+                name = contract.name
+            else:
+                exchange = self.symbol_exchange_map.get(symbol, None)
 
-        if not exchange:
-            return
+            if not exchange:
+                return
 
-        # 对大商所的交易日字段取本地日期
-        if not data["ActionDay"] or exchange == Exchange.DCE:
-            date_str: str = self.current_date
-        else:
-            date_str = data["ActionDay"]
+            # 对大商所的交易日字段取本地日期
+            if not data["ActionDay"] or exchange == Exchange.DCE:
+                date_str: str = self.current_date
+            else:
+                date_str = data["ActionDay"]
 
-        timestamp: str = f"{date_str} {data['UpdateTime']}.{data['UpdateMillisec']}"
-        dt: datetime = datetime.strptime(timestamp, "%Y%m%d %H:%M:%S.%f")
-        dt = dt.replace(tzinfo=CHINA_TZ)
+            timestamp: str = f"{date_str} {data['UpdateTime']}.{data['UpdateMillisec']:03d}"
+            dt: datetime = datetime.strptime(timestamp, "%Y%m%d %H:%M:%S.%f")
+            dt = dt.replace(tzinfo=CHINA_TZ)
 
-        tick: TickData = TickData(
-            symbol=symbol,
-            exchange=exchange,
-            datetime=dt,
-            name=name,
-            volume=data["Volume"],
-            turnover=data["Turnover"],
-            open_interest=data["OpenInterest"],
-            last_price=adjust_price(data["LastPrice"]),
-            limit_up=data["UpperLimitPrice"],
-            limit_down=data["LowerLimitPrice"],
-            open_price=adjust_price(data["OpenPrice"]),
-            high_price=adjust_price(data["HighestPrice"]),
-            low_price=adjust_price(data["LowestPrice"]),
-            pre_close=adjust_price(data["PreClosePrice"]),
-            bid_price_1=adjust_price(data["BidPrice1"]),
-            ask_price_1=adjust_price(data["AskPrice1"]),
-            bid_volume_1=data["BidVolume1"],
-            ask_volume_1=data["AskVolume1"],
-            gateway_name=self.gateway_name
-        )
+            tick: TickData = TickData(
+                symbol=symbol,
+                exchange=exchange,
+                datetime=dt,
+                name=name,
+                volume=data["Volume"],
+                turnover=data["Turnover"],
+                open_interest=data["OpenInterest"],
+                last_price=adjust_price(data["LastPrice"]),
+                limit_up=data["UpperLimitPrice"],
+                limit_down=data["LowerLimitPrice"],
+                open_price=adjust_price(data["OpenPrice"]),
+                high_price=adjust_price(data["HighestPrice"]),
+                low_price=adjust_price(data["LowestPrice"]),
+                pre_close=adjust_price(data["PreClosePrice"]),
+                bid_price_1=adjust_price(data["BidPrice1"]),
+                ask_price_1=adjust_price(data["AskPrice1"]),
+                bid_volume_1=data["BidVolume1"],
+                ask_volume_1=data["AskVolume1"],
+                gateway_name=self.gateway_name
+            )
 
-        if data["BidVolume2"] or data["AskVolume2"]:
-            tick.bid_price_2 = adjust_price(data["BidPrice2"])
-            tick.bid_price_3 = adjust_price(data["BidPrice3"])
-            tick.bid_price_4 = adjust_price(data["BidPrice4"])
-            tick.bid_price_5 = adjust_price(data["BidPrice5"])
+            if data["BidVolume2"] or data["AskVolume2"]:
+                tick.bid_price_2 = adjust_price(data["BidPrice2"])
+                tick.bid_price_3 = adjust_price(data["BidPrice3"])
+                tick.bid_price_4 = adjust_price(data["BidPrice4"])
+                tick.bid_price_5 = adjust_price(data["BidPrice5"])
 
-            tick.ask_price_2 = adjust_price(data["AskPrice2"])
-            tick.ask_price_3 = adjust_price(data["AskPrice3"])
-            tick.ask_price_4 = adjust_price(data["AskPrice4"])
-            tick.ask_price_5 = adjust_price(data["AskPrice5"])
+                tick.ask_price_2 = adjust_price(data["AskPrice2"])
+                tick.ask_price_3 = adjust_price(data["AskPrice3"])
+                tick.ask_price_4 = adjust_price(data["AskPrice4"])
+                tick.ask_price_5 = adjust_price(data["AskPrice5"])
 
-            tick.bid_volume_2 = data["BidVolume2"]
-            tick.bid_volume_3 = data["BidVolume3"]
-            tick.bid_volume_4 = data["BidVolume4"]
-            tick.bid_volume_5 = data["BidVolume5"]
+                tick.bid_volume_2 = data["BidVolume2"]
+                tick.bid_volume_3 = data["BidVolume3"]
+                tick.bid_volume_4 = data["BidVolume4"]
+                tick.bid_volume_5 = data["BidVolume5"]
 
-            tick.ask_volume_2 = data["AskVolume2"]
-            tick.ask_volume_3 = data["AskVolume3"]
-            tick.ask_volume_4 = data["AskVolume4"]
-            tick.ask_volume_5 = data["AskVolume5"]
+                tick.ask_volume_2 = data["AskVolume2"]
+                tick.ask_volume_3 = data["AskVolume3"]
+                tick.ask_volume_4 = data["AskVolume4"]
+                tick.ask_volume_5 = data["AskVolume5"]
 
-        self.gateway.on_tick(tick)
+            self.gateway.on_tick(tick)
 
-    def connect(
-        self,
-        addresses: list[str],
-        userid: str,
-        password: str,
-        brokerid: str,
-        production_mode: bool
-    ) -> None:
-        """连接服务器"""
-        self.userid = userid
-        self.password = password
-        self.brokerid = brokerid
+        def connect(
+            self,
+            addresses: list[str],
+            userid: str,
+            password: str,
+            brokerid: str,
+            production_mode: bool
+        ) -> None:
+            """连接服务器"""
+            self.userid = userid
+            self.password = password
+            self.brokerid = brokerid
 
-        # 禁止重复发起连接，会导致异常崩溃
-        if not self.connect_status:
-            path: Path = get_folder_path(self.gateway_name.lower())
-            self.createFtdcMdApi((str(path) + "\\Md").encode("GBK"), production_mode)
+            # 禁止重复发起连接，会导致异常崩溃
+            if not self.connect_status:
+                path: Path = get_folder_path(self.gateway_name.lower())
+                self.createFtdcMdApi((str(path) + "\\Md").encode("GBK"), production_mode)
 
-            for address in addresses:
-                self.registerFront(address)
-            self.init()
+                for address in addresses:
+                    self.registerFront(address)
+                self.init()
 
-            self.connect_status = True
+                self.connect_status = True
 
-    def login(self) -> None:
-        """用户登录"""
-        jees_req: dict = {
-            "UserID": self.userid,
-            "Password": self.password,
-            "BrokerID": self.brokerid
-        }
+        def login(self) -> None:
+            """用户登录"""
+            jees_req: dict = {
+                "UserID": self.userid,
+                "Password": self.password,
+                "BrokerID": self.brokerid
+            }
 
-        self.reqid += 1
-        self.reqUserLogin(jees_req, self.reqid)
+            self.reqid += 1
+            self.reqUserLogin(jees_req, self.reqid)
 
-    def subscribe(self, req: SubscribeRequest) -> None:
-        """订阅行情"""
-        symbol: str = req.symbol
-        self.symbol_exchange_map[symbol] = req.exchange
-        self.subscribed.add(symbol)
-        self.subscribe_queue.append((symbol, True))
+        def subscribe(self, req: SubscribeRequest) -> None:
+            """订阅行情"""
+            symbol: str = req.symbol
+            self.symbol_exchange_map[symbol] = req.exchange
+            self.subscribed.add(symbol)
+            self.subscribe_queue.append((symbol, True))
 
-    def unsubscribe(self, req: SubscribeRequest) -> None:
-        """退订行情"""
-        symbol: str = req.symbol
-        self.subscribed.discard(symbol)
-        self.subscribe_queue.append((symbol, False))
+        def unsubscribe(self, req: SubscribeRequest) -> None:
+            """退订行情"""
+            symbol: str = req.symbol
+            self.subscribed.discard(symbol)
+            self.subscribe_queue.append((symbol, False))
 
-    def flush_subscribe_queue(self) -> None:
-        """定时批量发送订阅/退订请求"""
-        if not self.login_status:
-            return
+        def flush_subscribe_queue(self) -> None:
+            """定时批量发送订阅/退订请求"""
+            if not self.login_status:
+                return
 
-        latest_actions: dict[str, bool] = {}
+            latest_actions: dict[str, bool] = {}
 
-        while self.subscribe_queue:
-            symbol, subscribe = self.subscribe_queue.popleft()
-            latest_actions[symbol] = subscribe
+            while self.subscribe_queue:
+                symbol, subscribe = self.subscribe_queue.popleft()
+                latest_actions[symbol] = subscribe
 
-        if not latest_actions:
-            return
+            if not latest_actions:
+                return
 
-        subscribe_symbols: list[str] = [
-            symbol for symbol, subscribe in latest_actions.items() if subscribe
-        ]
-        unsubscribe_symbols: list[str] = [
-            symbol for symbol, subscribe in latest_actions.items() if not subscribe
-        ]
+            subscribe_symbols: list[str] = [
+                symbol for symbol, subscribe in latest_actions.items() if subscribe
+            ]
+            unsubscribe_symbols: list[str] = [
+                symbol for symbol, subscribe in latest_actions.items() if not subscribe
+            ]
 
-        if subscribe_symbols:
-            self.subscribeMarketData(subscribe_symbols)
+            if subscribe_symbols:
+                self.subscribeMarketData(subscribe_symbols)
 
-        if unsubscribe_symbols:
-            self.unSubscribeMarketData(unsubscribe_symbols)
+            if unsubscribe_symbols:
+                self.unSubscribeMarketData(unsubscribe_symbols)
 
-    def close(self) -> None:
-        """关闭连接"""
-        if self.connect_status:
-            self.exit()
+        def close(self) -> None:
+            """关闭连接"""
+            if self.connect_status:
+                self.exit()
 
-    def update_date(self) -> None:
-        """更新当前日期"""
-        self.current_date = datetime.now().strftime("%Y%m%d")
+        def update_date(self) -> None:
+            """更新当前日期"""
+            self.current_date = datetime.now().strftime("%Y%m%d")
 
 
 class JeesTdApi(TdApi):

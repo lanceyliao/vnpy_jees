@@ -37,20 +37,20 @@ extra_link_args = []
 if host_machine.system() == 'windows'
   # Windows编译器设置
   add_project_arguments('/MT', language : 'cpp')
-  
+
   # 设置库目录
   lib_dir = meson.current_source_dir() / 'vnpy_jees/api/libs'
   api_dir = meson.current_source_dir() / 'vnpy_jees/api'
-  
+
   # 设置include目录
   include_dirs = include_directories(
     'vnpy_jees/api/include',
     'vnpy_jees/api/vnjees',
     pybind11_include_dir,
   )
-  
+
   # 定义CTP库
-  thosttraderapi_lib = cpp.find_library('thosttraderapi_se', 
+  thosttraderapi_lib = cpp.find_library('thosttraderapi_se',
                                        dirs: [lib_dir, api_dir],
                                        required: true)
 
@@ -63,23 +63,23 @@ else  # Linux
     '-Wno-delete-incomplete',
     '-Wno-sign-compare',
   ]
-  
+
   extra_link_args = [
     '-lstdc++',
   ]
-  
+
   # 设置库目录
   lib_dir = meson.current_source_dir() / 'vnpy_jees/api'
-  
+
   # 设置include目录
   include_dirs = include_directories(
     'vnpy_jees/api/include',
     'vnpy_jees/api/vnjees',
     pybind11_include_dir,
   )
-  
+
   # 定义CTP库
-  thosttraderapi_lib = cpp.find_library('thosttraderapi_se', 
+  thosttraderapi_lib = cpp.find_library('thosttraderapi_se',
                                        dirs: [lib_dir],
                                        required: true)
 endif
@@ -123,7 +123,7 @@ if host_machine.system() == 'windows'
   api_libs = [
     'vnpy_jees/api/thosttraderapi_se.dll',
   ]
-  
+
   install_data(
     api_libs,
     install_dir: py.get_install_dir() / 'vnpy_jees/api'
@@ -132,9 +132,16 @@ else  # Linux
   api_libs = [
     'vnpy_jees/api/libthosttraderapi_se.so',
   ]
-  
+
   install_data(
     api_libs,
     install_dir: py.get_install_dir() / 'vnpy_jees/api'
   )
 endif
+
+# 可编辑安装的扩展在构建目录，厂商库仍在源码树。
+# 拷到扩展旁边后，Windows 在 .pyd 所在目录找 DLL，Linux 用扩展的 $ORIGIN 找 .so。
+# 这些拷贝不安装；正式安装仍由上面的 install_data 放到 site-packages。
+foreach lib : api_libs
+  fs.copyfile(lib)
+endforeach
