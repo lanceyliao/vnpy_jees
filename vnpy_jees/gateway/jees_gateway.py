@@ -1,9 +1,11 @@
 """实现杰宜斯交易接口。"""
 
-from collections.abc import Callable
 import json
+import os
 import re
+from collections.abc import Callable
 import sys
+from math import ceil
 from collections import deque
 from datetime import datetime, timedelta
 from time import sleep
@@ -169,6 +171,7 @@ class Settlement:
         self.filename: str = ""
 
     def _begin(self, trading_day: str, userid: str, reqid: int) -> None:
+        """发起查询时固定 trading_day、userid、reqid，并生成 settlement 目录下的文件名（不含路径）。"""
         self._clear_pending()
         self.text = ""
         self.trading_day = trading_day
@@ -214,6 +217,7 @@ class Settlement:
         self._clear_pending()
 
     def _save(self) -> Path:
+        """目录来自 get_folder_path，文件名为 _begin 已定的 self.filename。"""
         if not self.text:
             raise ValueError("Settlement._save: 无正文")
         if not self.filename:
@@ -254,32 +258,12 @@ class JeesGateway(BaseGateway):
         self.settlements: dict[str, Settlement] = self.td_api.settlements
 
         self.count: int = 0
+        interval: float = event_engine._interval or 1
+        self.query_interval: int = max(1, ceil(2 / interval))
         self._limit_price_cache: dict[str, dict[str, float]] = {}
         self._limit_retry_registered: bool = False
         self.orders: dict[str, OrderData] = {}
         self._order_lock = Lock()
-
-    def on_order(self, order: OrderData) -> None:
-        """仅推送有效增量：成交量上涨，或成交量不变但状态变化"""
-        # 柜台回调线程和EventEngine下单线程都可能进入此处。必须把判重、
-        # 缓存更新和事件入队作为整体串行化，避免终态后出现状态倒退。
-        with self._order_lock:
-            last_order: OrderData | None = self.orders.get(order.orderid)
-            if last_order:
-                if not last_order.is_active():
-                    self.write_log(
-                        f"忽略订单回报，订单号：{order.orderid}，状态：{order.status}，"
-                        f"已成交：{order.traded}，剩余：{order.volume - order.traded}"
-                    )
-                    return
-
-                traded_change: float = order.traded - last_order.traded
-                status_change: bool = order.status != last_order.status
-                if traded_change < 0 or (traded_change == 0 and not status_change):
-                    return
-
-            self.orders[order.orderid] = order
-            super().on_order(order)
 
     def connect(self, setting: dict) -> None:
         """连接交易接口"""
@@ -313,10 +297,9 @@ class JeesGateway(BaseGateway):
         self._set_limit_retry(not self._load_limit_prices())
 
         self.td_api.connect(td_address, userid, password, brokerid, auth_code, appid)
+        self.init_query()
         if MdApi is not None:
             self.md_api.connect(md_addresses, userid, password, brokerid, production_mode)
-
-        self.init_query()
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
@@ -372,19 +355,14 @@ class JeesGateway(BaseGateway):
 
     def process_timer_event(self, event: Event) -> None:
         """定时事件处理"""
-        self.md_api.flush_subscribe_queue()
-
         self.count += 1
-        if self.count < 2:
+        if self.count < self.query_interval:
             return
         self.count = 0
 
         func: Callable[[], None] = self.query_functions.pop(0)
         func()
         self.query_functions.append(func)
-
-        if MdApi is not None:
-            self.md_api.update_date()
 
     def init_query(self) -> None:
         """初始化查询任务"""
@@ -396,6 +374,28 @@ class JeesGateway(BaseGateway):
         """合约信息推送"""
         self._apply_limit_prices(contract)
         super().on_contract(contract)
+
+    def on_order(self, order: OrderData) -> None:
+        """仅推送有效增量：成交量上涨，或成交量不变但状态变化"""
+        # 柜台回调线程和EventEngine下单线程都可能进入此处。必须把判重、
+        # 缓存更新和事件入队作为整体串行化，避免终态后出现状态倒退。
+        with self._order_lock:
+            last_order: OrderData | None = self.orders.get(order.orderid)
+            if last_order:
+                if not last_order.is_active():
+                    self.write_log(
+                        f"忽略订单回报，订单号：{order.orderid}，状态：{order.status}，"
+                        f"已成交：{order.traded}，剩余：{order.volume - order.traded}"
+                    )
+                    return
+
+                traded_change: float = order.traded - last_order.traded
+                status_change: bool = order.status != last_order.status
+                if traded_change < 0 or (traded_change == 0 and not status_change):
+                    return
+
+            self.orders[order.orderid] = order
+            super().on_order(order)
 
     def _apply_limit_prices(self, contract: ContractData) -> None:
         """把缓存中的涨跌停价写回合约对象"""
@@ -481,6 +481,10 @@ if TYPE_CHECKING or MdApi is not None:
 
             self.current_date: str = datetime.now().strftime("%Y%m%d")
 
+            # 订阅队列刷新计数器
+            self.sub_count: int = 0
+            self.sub_interval: int = 0  # 将在 connect 时设置
+
         def onFrontConnected(self) -> None:
             """服务器连接成功回报"""
             self.gateway.write_log("行情服务器连接成功")
@@ -496,6 +500,9 @@ if TYPE_CHECKING or MdApi is not None:
             if not error["ErrorID"]:
                 self.login_status = True
                 self.gateway.write_log("行情服务器登录成功")
+
+                # 注册定时器用于刷新订阅队列和更新日期
+                self.gateway.event_engine.register(EVENT_TIMER, self.process_timer_event)
 
                 symbol: str
                 for symbol in self.subscribed:
@@ -603,10 +610,14 @@ if TYPE_CHECKING or MdApi is not None:
             self.password = password
             self.brokerid = brokerid
 
+            # 设置订阅刷新间隔
+            interval: float = self.gateway.event_engine._interval or 1
+            self.sub_interval = max(1, ceil(1 / interval))
+
             # 禁止重复发起连接，会导致异常崩溃
             if not self.connect_status:
                 path: Path = get_folder_path(self.gateway_name.lower())
-                self.createFtdcMdApi((str(path) + "\\Md").encode("GBK"), production_mode)
+                self.createFtdcMdApi(os.fsencode(path / "Md"), production_mode)
 
                 for address in addresses:
                     self.registerFront(address)
@@ -616,14 +627,14 @@ if TYPE_CHECKING or MdApi is not None:
 
         def login(self) -> None:
             """用户登录"""
-            jees_req: dict = {
+            req: dict = {
                 "UserID": self.userid,
                 "Password": self.password,
                 "BrokerID": self.brokerid
             }
 
             self.reqid += 1
-            self.reqUserLogin(jees_req, self.reqid)
+            self.reqUserLogin(req, self.reqid)
 
         def subscribe(self, req: SubscribeRequest) -> None:
             """订阅行情"""
@@ -642,6 +653,12 @@ if TYPE_CHECKING or MdApi is not None:
             """定时批量发送订阅/退订请求"""
             if not self.login_status:
                 return
+
+            # 计数器控制刷新频率
+            self.sub_count += 1
+            if self.sub_count < self.sub_interval:
+                return
+            self.sub_count = 0
 
             latest_actions: dict[str, bool] = {}
 
@@ -664,6 +681,11 @@ if TYPE_CHECKING or MdApi is not None:
 
             if unsubscribe_symbols:
                 self.unSubscribeMarketData(unsubscribe_symbols)
+
+        def process_timer_event(self, event: Event) -> None:
+            """定时事件处理"""
+            self.flush_subscribe_queue()
+            self.update_date()
 
         def close(self) -> None:
             """关闭连接"""
@@ -745,57 +767,16 @@ class JeesTdApi(TdApi):
             self.gateway.write_log("交易服务器登录成功")
 
             # 自动确认结算单
-            jees_req: dict = {
+            req: dict = {
                 "BrokerID": self.brokerid,
                 "InvestorID": self.userid
             }
             self.reqid += 1
-            self.reqSettlementInfoConfirm(jees_req, self.reqid)
+            self.reqSettlementInfoConfirm(req, self.reqid)
         else:
             self.login_failed = True
 
             self.gateway.write_error("交易服务器登录失败", error)
-
-    def onRspQrySettlementInfo(self, data: dict, error: dict, reqid: int, last: bool) -> None:
-        """查询投资者结算结果（分包累加，last 收尾）"""
-        cap: Settlement = self.settlement_cap
-        if not cap._matches(reqid):
-            return
-
-        if error.get("ErrorID", 0):
-            self.gateway.write_error("查询结算信息失败", error)
-            if last:
-                cap._clear_pending()
-            return
-
-        cap._ingest(data)
-
-        if not last:
-            return
-
-        body: bytes = cap._take_merged()
-
-        if body:
-            try:
-                text = body.decode("utf-8")
-            except UnicodeDecodeError:
-                try:
-                    text = body.decode("gbk")
-                except UnicodeDecodeError:
-                    text = body.decode("utf-8", errors="replace")
-            cap._seal(text)
-            self.settlements[cap.trading_day] = cap
-            path: Path = cap._save()
-            self.gateway.write_log(
-                f"结算信息 {cap.trading_day} 已拼齐 {len(body)} 字节，已缓存并写入 {path}"
-            )
-            self.settlement_cap = Settlement()
-            return
-
-        self.gateway.write_log(
-            "结算信息查询完成，正文为空（可 query_settlement() 用 default_qday，或显式传入 yyyymmdd / yymm）"
-        )
-        cap._clear_pending()
 
     def onRspOrderInsert(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         """委托下单失败回报"""
@@ -816,6 +797,7 @@ class JeesTdApi(TdApi):
             status=Status.REJECTED,
             gateway_name=self.gateway_name
         )
+        # 添加拒单原因，供下游解析错误码和信息
         order.rejected_reason = json.dumps({"code": error["ErrorID"], "msg": error["ErrorMsg"]}, ensure_ascii=False)
         self.gateway.on_order(order)
 
@@ -824,6 +806,47 @@ class JeesTdApi(TdApi):
     def onRspOrderAction(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         """委托撤单失败回报"""
         self.gateway.write_error("交易撤单失败", error)
+
+    def onRspQrySettlementInfo(self, data: dict, error: dict, reqid: int, last: bool) -> None:
+        """查询投资者结算结果（分包累加，last 时与持仓查询一样收尾）"""
+        cap: Settlement = self.settlement_cap
+        if not cap._matches(reqid):
+            return
+
+        if error.get("ErrorID", 0):
+            self.gateway.write_error("查询结算信息失败", error)
+            if last:
+                cap._clear_pending()
+            return
+
+        cap._ingest(data)
+
+        if not last:
+            return
+
+        body: bytes = cap._take_merged()
+
+        if body:
+            try:
+                text: str = body.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    text = body.decode("gbk")
+                except UnicodeDecodeError:
+                    text = body.decode("utf-8", errors="replace")
+            cap._seal(text)
+            self.settlements[cap.trading_day] = cap
+            path: Path = cap._save()
+            self.gateway.write_log(
+                f"结算信息 {cap.trading_day} 已拼齐 {len(body)} 字节，已缓存并写入 {path}"
+            )
+            self.settlement_cap = Settlement()
+            return
+
+        self.gateway.write_log(
+            "结算信息查询完成，正文为空（可 query_settlement() 用 default_qday，或显式传入 yyyymmdd / yymm）"
+        )
+        cap._clear_pending()
 
     def onRspSettlementInfoConfirm(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         """确认结算单回报"""
@@ -929,12 +952,42 @@ class JeesTdApi(TdApi):
 
         self.gateway.on_account(account)
 
+    def query_order(self, orderid: str = "") -> int:
+        """查询委托；可传入 orderid 查询特定订单，不传则查询全部"""
+        req: dict = {
+            "BrokerID": self.brokerid,
+            "InvestorID": self.userid
+        }
+        if orderid:
+            # 通过 orderid_sysid_map 反向查找 OrderSysID
+            order_sysid = self.orderid_sysid_map.get(orderid)
+            if order_sysid:
+                req["OrderSysID"] = order_sysid
+            else:
+                # 如果找不到 OrderSysID，则查询全部订单
+                pass
+
+        self.reqid += 1
+        n: int = self.reqQryOrder(req, self.reqid)
+        return n
+
     def onRspQryOrder(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         """委托查询回报"""
         if not data:
             return
 
         self._process_order_update(data)
+
+    def query_trade(self) -> int:
+        """查询成交"""
+        req: dict = {
+            "BrokerID": self.brokerid,
+            "InvestorID": self.userid
+        }
+
+        self.reqid += 1
+        n: int = self.reqQryTrade(req, self.reqid)
+        return n
 
     def onRspQryTrade(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         """成交查询回报"""
@@ -1051,6 +1104,14 @@ class JeesTdApi(TdApi):
         self.sysid_orderid_map[data["OrderSysID"]] = orderid
         self.orderid_sysid_map[orderid] = data["OrderSysID"]
 
+        # 特殊情况撤单（非交易时段、资金不足等）的日志输出
+        status_msg: str = data.get("StatusMsg", "")
+        if (
+            data["OrderStatus"] == THOST_FTDC_OST_Canceled
+            and status_msg != "已撤单"       # 过滤正常撤单
+        ):
+            self.gateway.write_log(f"委托 {orderid} 状态更新，{status_msg}")
+
     def onRtnTrade(self, data: dict) -> None:
         """成交数据推送"""
         if not self.contract_inited:
@@ -1118,7 +1179,7 @@ class JeesTdApi(TdApi):
         if self.auth_failed:
             return
 
-        jees_req: dict = {
+        req: dict = {
             "UserID": self.userid,
             "BrokerID": self.brokerid,
             "AuthCode": self.auth_code,
@@ -1126,14 +1187,14 @@ class JeesTdApi(TdApi):
         }
 
         self.reqid += 1
-        self.reqAuthenticate(jees_req, self.reqid)
+        self.reqAuthenticate(req, self.reqid)
 
     def login(self) -> None:
         """用户登录"""
         if self.login_failed:
             return
 
-        jees_req: dict = {
+        req: dict = {
             "UserID": self.userid,
             "Password": self.password,
             "BrokerID": self.brokerid,
@@ -1141,7 +1202,7 @@ class JeesTdApi(TdApi):
         }
 
         self.reqid += 1
-        self.reqUserLogin(jees_req, self.reqid)
+        self.reqUserLogin(req, self.reqid)
 
     def send_order(self, req: OrderRequest) -> str:
         """委托下单"""
@@ -1161,7 +1222,7 @@ class JeesTdApi(TdApi):
         volume_condition: str
         price_type, time_condition, volume_condition = tp
 
-        jees_req: dict = {
+        req: dict = {
             "InstrumentID": req.symbol,
             "ExchangeID": req.exchange.value,
             "LimitPrice": req.price,
@@ -1183,7 +1244,7 @@ class JeesTdApi(TdApi):
         }
 
         self.reqid += 1
-        n: int = self.reqOrderInsert(jees_req, self.reqid)
+        n: int = self.reqOrderInsert(req, self.reqid)
         if n:
             self.gateway.write_log(f"委托请求发送失败，错误代码：{n}")
             return ""
@@ -1192,8 +1253,7 @@ class JeesTdApi(TdApi):
         order: OrderData = req.create_order_data(orderid, self.gateway_name)
         self.gateway.on_order(order)
 
-        vt_orderid: str = order.vt_orderid
-        return vt_orderid
+        return order.vt_orderid
 
     def cancel_order(self, req: CancelRequest) -> None:
         """委托撤单"""
@@ -1202,7 +1262,7 @@ class JeesTdApi(TdApi):
         order_ref: str
         frontid, sessionid, order_ref = req.orderid.split("_")
 
-        jees_req: dict = {
+        req: dict = {
             "InstrumentID": req.symbol,
             "ExchangeID": req.exchange.value,
             "OrderRef": order_ref,
@@ -1214,7 +1274,7 @@ class JeesTdApi(TdApi):
         }
 
         self.reqid += 1
-        self.reqOrderAction(jees_req, self.reqid)
+        self.reqOrderAction(req, self.reqid)
 
     def query_account(self) -> None:
         """查询资金"""
@@ -1226,52 +1286,22 @@ class JeesTdApi(TdApi):
         if not symbol_contract_map:
             return
 
-        jees_req: dict = {
+        req: dict = {
             "BrokerID": self.brokerid,
             "InvestorID": self.userid
         }
 
         self.reqid += 1
-        self.reqQryInvestorPosition(jees_req, self.reqid)
-
-    def query_order(self, orderid: str = "") -> int:
-        """查询委托；可传入 orderid 查询特定订单，不传则查询全部"""
-        jees_req: dict = {
-            "BrokerID": self.brokerid,
-            "InvestorID": self.userid
-        }
-        if orderid:
-            # 通过 orderid_sysid_map 反向查找 OrderSysID
-            order_sysid = self.orderid_sysid_map.get(orderid)
-            if order_sysid:
-                jees_req["OrderSysID"] = order_sysid
-            else:
-                # 如果找不到 OrderSysID，则查询全部订单
-                pass
-
-        self.reqid += 1
-        n: int = self.reqQryOrder(jees_req, self.reqid)
-        return n
-
-    def query_trade(self) -> int:
-        """查询成交"""
-        jees_req: dict = {
-            "BrokerID": self.brokerid,
-            "InvestorID": self.userid
-        }
-
-        self.reqid += 1
-        n: int = self.reqQryTrade(jees_req, self.reqid)
-        return n
+        self.reqQryInvestorPosition(req, self.reqid)
 
     def query_settlement(self, trading_day: str = "") -> None:
-        """发起一次 ReqQrySettlementInfo；未传 trading_day 时用 default_qday()（上海早于 18:00 为前一自然日，否则当天）。可传 yyyymmdd 或月结 yymm。"""
+        """发起一次 ReqQrySettlementInfo；未传 trading_day 时用 default_qday()（上海时区早于 18:00 用前一自然日，否则当天）。可传 yyyymmdd 或月结 yymm。"""
         if not self.login_status:
             self.gateway.write_log("尚未登录交易，跳过查询结算信息")
             return
 
         qday: str = trading_day or Settlement.default_qday()
-        jees_req: dict = {
+        req: dict = {
             "BrokerID": self.brokerid,
             "InvestorID": self.userid,
             "TradingDay": qday,
@@ -1280,7 +1310,7 @@ class JeesTdApi(TdApi):
 
         self.reqid += 1
         self.settlement_cap._begin(qday, self.userid, self.reqid)
-        n: int = self.reqQrySettlementInfo(jees_req, self.reqid)
+        n: int = self.reqQrySettlementInfo(req, self.reqid)
         if n:
             self.settlement_cap._abandon_send()
             self.gateway.write_log(f"查询结算单请求未发出（流控等），错误码：{n}，请稍后重试 query_settlement")
