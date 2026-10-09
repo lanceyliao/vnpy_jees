@@ -627,14 +627,14 @@ if TYPE_CHECKING or MdApi is not None:
 
         def login(self) -> None:
             """用户登录"""
-            req: dict = {
+            _req: dict = {
                 "UserID": self.userid,
                 "Password": self.password,
                 "BrokerID": self.brokerid
             }
 
             self.reqid += 1
-            self.reqUserLogin(req, self.reqid)
+            self.reqUserLogin(_req, self.reqid)
 
         def subscribe(self, req: SubscribeRequest) -> None:
             """订阅行情"""
@@ -767,12 +767,12 @@ class JeesTdApi(TdApi):
             self.gateway.write_log("交易服务器登录成功")
 
             # 自动确认结算单
-            req: dict = {
+            _req: dict = {
                 "BrokerID": self.brokerid,
                 "InvestorID": self.userid
             }
             self.reqid += 1
-            self.reqSettlementInfoConfirm(req, self.reqid)
+            self.reqSettlementInfoConfirm(_req, self.reqid)
         else:
             self.login_failed = True
 
@@ -954,7 +954,7 @@ class JeesTdApi(TdApi):
 
     def query_order(self, orderid: str = "") -> int:
         """查询委托；可传入 orderid 查询特定订单，不传则查询全部"""
-        req: dict = {
+        _req: dict = {
             "BrokerID": self.brokerid,
             "InvestorID": self.userid
         }
@@ -962,13 +962,13 @@ class JeesTdApi(TdApi):
             # 通过 orderid_sysid_map 反向查找 OrderSysID
             order_sysid = self.orderid_sysid_map.get(orderid)
             if order_sysid:
-                req["OrderSysID"] = order_sysid
+                _req["OrderSysID"] = order_sysid
             else:
                 # 如果找不到 OrderSysID，则查询全部订单
                 pass
 
         self.reqid += 1
-        n: int = self.reqQryOrder(req, self.reqid)
+        n: int = self.reqQryOrder(_req, self.reqid)
         return n
 
     def onRspQryOrder(self, data: dict, error: dict, reqid: int, last: bool) -> None:
@@ -1179,7 +1179,7 @@ class JeesTdApi(TdApi):
         if self.auth_failed:
             return
 
-        req: dict = {
+        _req: dict = {
             "UserID": self.userid,
             "BrokerID": self.brokerid,
             "AuthCode": self.auth_code,
@@ -1187,14 +1187,14 @@ class JeesTdApi(TdApi):
         }
 
         self.reqid += 1
-        self.reqAuthenticate(req, self.reqid)
+        self.reqAuthenticate(_req, self.reqid)
 
     def login(self) -> None:
         """用户登录"""
         if self.login_failed:
             return
 
-        req: dict = {
+        _req: dict = {
             "UserID": self.userid,
             "Password": self.password,
             "BrokerID": self.brokerid,
@@ -1202,7 +1202,7 @@ class JeesTdApi(TdApi):
         }
 
         self.reqid += 1
-        self.reqUserLogin(req, self.reqid)
+        self.reqUserLogin(_req, self.reqid)
 
     def send_order(self, req: OrderRequest) -> str:
         """委托下单"""
@@ -1222,7 +1222,7 @@ class JeesTdApi(TdApi):
         volume_condition: str
         price_type, time_condition, volume_condition = tp
 
-        req: dict = {
+        _req: dict = {
             "InstrumentID": req.symbol,
             "ExchangeID": req.exchange.value,
             "LimitPrice": req.price,
@@ -1244,7 +1244,7 @@ class JeesTdApi(TdApi):
         }
 
         self.reqid += 1
-        n: int = self.reqOrderInsert(req, self.reqid)
+        n: int = self.reqOrderInsert(_req, self.reqid)
         if n:
             self.gateway.write_log(f"委托请求发送失败，错误代码：{n}")
             return ""
@@ -1262,7 +1262,7 @@ class JeesTdApi(TdApi):
         order_ref: str
         frontid, sessionid, order_ref = req.orderid.split("_")
 
-        req: dict = {
+        _req: dict = {
             "InstrumentID": req.symbol,
             "ExchangeID": req.exchange.value,
             "OrderRef": order_ref,
@@ -1274,7 +1274,7 @@ class JeesTdApi(TdApi):
         }
 
         self.reqid += 1
-        self.reqOrderAction(req, self.reqid)
+        self.reqOrderAction(_req, self.reqid)
 
     def query_account(self) -> None:
         """查询资金"""
@@ -1286,13 +1286,13 @@ class JeesTdApi(TdApi):
         if not symbol_contract_map:
             return
 
-        req: dict = {
+        _req: dict = {
             "BrokerID": self.brokerid,
             "InvestorID": self.userid
         }
 
         self.reqid += 1
-        self.reqQryInvestorPosition(req, self.reqid)
+        self.reqQryInvestorPosition(_req, self.reqid)
 
     def query_settlement(self, trading_day: str = "") -> None:
         """发起一次 ReqQrySettlementInfo；未传 trading_day 时用 default_qday()（上海时区早于 18:00 用前一自然日，否则当天）。可传 yyyymmdd 或月结 yymm。"""
@@ -1301,7 +1301,7 @@ class JeesTdApi(TdApi):
             return
 
         qday: str = trading_day or Settlement.default_qday()
-        req: dict = {
+        _req: dict = {
             "BrokerID": self.brokerid,
             "InvestorID": self.userid,
             "TradingDay": qday,
@@ -1310,7 +1310,7 @@ class JeesTdApi(TdApi):
 
         self.reqid += 1
         self.settlement_cap._begin(qday, self.userid, self.reqid)
-        n: int = self.reqQrySettlementInfo(req, self.reqid)
+        n: int = self.reqQrySettlementInfo(_req, self.reqid)
         if n:
             self.settlement_cap._abandon_send()
             self.gateway.write_log(f"查询结算单请求未发出（流控等），错误码：{n}，请稍后重试 query_settlement")
